@@ -5,6 +5,8 @@ Manage FlagD Feature Flags Tool
 This tool allows remote management of OpenTelemetry Demo feature flags
 by updating Kubernetes ConfigMaps and triggering pod restarts.
 
+No external dependencies like kubectl required - uses pure Python kubernetes library.
+
 Usage:
     python manage_flags.py --flag <flag_name> --value <variant_value>
     python manage_flags.py --flag productCatalogFailure --value on
@@ -17,8 +19,9 @@ For custom kubeconfig:
 import argparse
 import json
 import os
-import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -29,22 +32,6 @@ except ImportError:
     print("Run: pip install -r requirements.txt")
     sys.exit(1)
 
-
-def get_flagd_pod(v1, namespace, label_selector="app.kubernetes.io/name=flagd"):
-    """Find a running flagd pod in the given namespace."""
-    try:
-        pods = v1.list_namespaced_pod(namespace, label_selector=label_selector)
-        if not pods.items:
-            # Fallback to component label
-            pods = v1.list_namespaced_pod(namespace, label_selector="app.kubernetes.io/component=flagd")
-            
-        for pod in pods.items:
-            if pod.status.phase == "Running":
-                return pod.metadata.name
-        return None
-    except ApiException as e:
-        print(f"Error viewing pods: {e}")
-        return None
 
 
 def list_flags(v1, namespace, config_map_name):
@@ -123,46 +110,58 @@ def update_config_map(v1, namespace, config_map_name, flag_name, variant_value):
         return None
 
 
-def hot_reload_pod(v1, namespace, pod_name, kubeconfig_path=None):
-    """Restart the flagd deployment to pick up ConfigMap changes."""
+def hot_reload_pod(namespace, deployment_name="flagd"):
+    """
+    Restart the flagd deployment to pick up ConfigMap changes.
+    Uses pure Python kubernetes library - no kubectl required.
+    """
     try:
         print("Triggering pod restart to reload configuration...")
         
-        restart_cmd = [
-            'kubectl', 'rollout', 'restart',
-            'deployment/flagd',
-            '-n', namespace
-        ]
+        apps_v1 = client.AppsV1Api()
         
-        # Add kubeconfig if specified
-        if kubeconfig_path:
-            restart_cmd.extend(['--kubeconfig', kubeconfig_path])
+        # Patch the deployment with a restart annotation (same as kubectl rollout restart)
+        restart_annotation = {
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "kubectl.kubernetes.io/restartedAt": datetime.now(timezone.utc).isoformat()
+                        }
+                    }
+                }
+            }
+        }
         
-        resp = subprocess.run(restart_cmd, capture_output=True, text=True)
+        apps_v1.patch_namespaced_deployment(
+            name=deployment_name,
+            namespace=namespace,
+            body=restart_annotation
+        )
+        print("Deployment restart triggered successfully.")
         
-        if resp.returncode == 0:
-            print("Deployment restart triggered successfully.")
-            print("Waiting for rollout to complete...")
+        # Wait for rollout to complete
+        print("Waiting for rollout to complete...")
+        max_wait = 60
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            deployment = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+            status = deployment.status
             
-            wait_cmd = [
-                'kubectl', 'rollout', 'status',
-                'deployment/flagd',
-                '-n', namespace,
-                '--timeout=60s'
-            ]
-            
-            if kubeconfig_path:
-                wait_cmd.extend(['--kubeconfig', kubeconfig_path])
-            
-            wait_resp = subprocess.run(wait_cmd, capture_output=True, text=True)
-            
-            if wait_resp.returncode == 0:
+            # Check if rollout is complete
+            if (status.updated_replicas == status.replicas and
+                status.ready_replicas == status.replicas and
+                status.available_replicas == status.replicas):
                 print("✓ Pod restarted successfully! Flags updated.")
-            else:
-                print(f"Warning: Rollout status check failed: {wait_resp.stderr}")
-        else:
-            print(f"Error triggering restart: {resp.stderr}")
-
+                return
+            
+            time.sleep(2)
+        
+        print("Warning: Rollout did not complete within 60 seconds, but changes are persisted.")
+        
+    except ApiException as e:
+        print(f"Error restarting deployment: {e.reason}")
     except Exception as e:
         print(f"Error executing reload: {e}")
 
@@ -257,11 +256,7 @@ Examples:
     new_json_content = update_config_map(v1, args.namespace, args.config_map, args.flag, args.value)
     
     if new_json_content:
-        pod_name = get_flagd_pod(v1, args.namespace)
-        if pod_name:
-            hot_reload_pod(v1, args.namespace, pod_name, kubeconfig_path)
-        else:
-            print("Warning: Could not find running flagd pod. Change is persisted but hot-reload failed.")
+        hot_reload_pod(args.namespace)
     
     print("")
 
